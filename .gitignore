@@ -1,0 +1,17 @@
+﻿# Secrets
+.env
+.streamlit/secrets.toml
+
+# Python environment
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Patent embeddings and uploaded corpora
+.cache/
+relevanceiq_cache/
+relevanceiq_uploads/
+
+# Generated embedding files
+*.npy

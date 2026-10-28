@@ -1,0 +1,12 @@
+streamlit
+openai
+langchain
+langchain-openai
+langchain-huggingface
+langgraph
+python-dotenv
+pandas
+openpyxl
+huggingface_hub
+grandalf
+scikit-learn
