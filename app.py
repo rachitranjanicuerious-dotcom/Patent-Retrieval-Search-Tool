@@ -1,7 +1,9 @@
 from __future__ import annotations
+import hashlib
 import os
 import re
-from typing import Any
+import time
+from typing import Any, Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -35,6 +37,13 @@ EMBEDDING_CHUNK_CHARS = 3_000
 QUERY_MAX_CHARS = 6_000
 EMBEDDING_BATCH_SIZE = 64
 
+# Embedding cache settings (same behaviour as before: 24 h, 2 corpora).
+EMBEDDING_CACHE_TTL_SECONDS = 86_400
+EMBEDDING_CACHE_MAX_ENTRIES = 2
+
+# A progress callback receives (fraction between 0 and 1, status message).
+ProgressCallback = Callable[[float, str], None]
+
 COLUMN_ALIASES = {
     PUBLICATION_COL: [
         "publication number", "publication_number",   "Publication_Number" ,
@@ -56,6 +65,30 @@ COLUMN_ALIASES = {
             "Claims" , "claims"
         ],
 }
+
+
+# ---------------------------------------------------------------------------
+# Progress helpers
+# ---------------------------------------------------------------------------
+
+def _report(callback: Optional[ProgressCallback], fraction: float, message: str) -> None:
+    """Send a progress update if a callback was provided."""
+    if callback is not None:
+        callback(min(max(float(fraction), 0.0), 1.0), message)
+
+
+def _scaled(
+    callback: Optional[ProgressCallback], start: float, end: float
+) -> Optional[ProgressCallback]:
+    """Map a sub-task's 0..1 progress onto the [start, end] slice of the full run."""
+    if callback is None:
+        return None
+
+    def inner(fraction: float, message: str) -> None:
+        callback(start + (end - start) * min(max(float(fraction), 0.0), 1.0), message)
+
+    return inner
+
 
 def normalize_header(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value)).strip().lower()
@@ -144,7 +177,7 @@ def tfidf_search(query: str, documents: list[str]) -> list[float]:
         lowercase=True,
         stop_words="english",
         ngram_range=(1, 2),
-        max_features= 200_000 , #300_000
+        max_features= 300_000 , 
         sublinear_tf=True,
     )
     matrix = vectorizer.fit_transform(corpus)
@@ -173,13 +206,47 @@ def split_for_embeddings(text: str, max_chars: int = EMBEDDING_CHUNK_CHARS) -> l
     chunks = [text[start:start + max_chars] for start in range(0, len(text), step)]
     return [chunk for chunk in chunks if chunk.strip()]
 
-@st.cache_data(show_spinner=False, ttl=86400, max_entries=2)
+
+@st.cache_resource(show_spinner=False)
+def get_embedding_store() -> dict:
+    """Process-wide store for corpus embeddings (entries expire after 24 h).
+
+    A manual store is used instead of st.cache_data so the embedding step can
+    report live progress without Streamlit replaying UI updates on cache hits.
+    """
+    return {}
+
+
 def get_document_embeddings(
-    documents: tuple[str, ...], model_name: str, api_key: str
+    documents: tuple[str, ...] | list[str],
+    model_name: str,
+    api_key: str,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Embed patent chunks once; return chunk vectors and their patent indexes."""
     if OpenAI is None:
         raise RuntimeError("OpenAI package is missing")
+
+    # Cache lookup (keyed by corpus text + model + chunk size).
+    store = get_embedding_store()
+    digest = hashlib.sha1()
+    digest.update(f"{model_name}|{EMBEDDING_CHUNK_CHARS}".encode())
+    for document in documents:
+        digest.update(document.encode("utf-8", "ignore"))
+        digest.update(b"\0")
+    cache_key = digest.hexdigest()
+
+    now = time.time()
+    for stale_key in [
+        key for key, entry in store.items()
+        if now - entry["created_at"] > EMBEDDING_CACHE_TTL_SECONDS
+    ]:
+        store.pop(stale_key, None)
+
+    cached = store.get(cache_key)
+    if cached is not None:
+        _report(progress_callback, 1.0, "Using cached patent embeddings from a previous run")
+        return cached["vectors"], cached["indexes"]
 
     chunks: list[str] = []
     patent_indexes: list[int] = []
@@ -188,37 +255,70 @@ def get_document_embeddings(
             chunks.append(chunk)
             patent_indexes.append(patent_index)
 
-    client = OpenAI(api_key=api_key)
-    vectors: list[list[float] | None] = [None] * len(chunks)
+    total_chunks = len(chunks)
+    _report(
+        progress_callback, 0.0,
+        f"Embedding patent text: 0 of {total_chunks:,} sections"
+    )
 
-    for start in range(0, len(chunks), EMBEDDING_BATCH_SIZE):
+    client = OpenAI(api_key=api_key)
+    vectors: list[list[float] | None] = [None] * total_chunks
+
+    for start in range(0, total_chunks, EMBEDDING_BATCH_SIZE):
         batch = chunks[start:start + EMBEDDING_BATCH_SIZE]
         response = client.embeddings.create(model=model_name, input=batch)
         for item in response.data:
             vectors[start + item.index] = item.embedding
 
+        done = min(start + len(batch), total_chunks)
+        _report(
+            progress_callback,
+            done / total_chunks,
+            f"Embedding patent text (first run only): {done:,} of {total_chunks:,} sections",
+        )
+
     if any(vector is None for vector in vectors):
         raise RuntimeError("The embedding API did not return an embedding for every patent chunk.")
-    return np.asarray(vectors, dtype=np.float32), np.asarray(patent_indexes, dtype=np.int32)
+
+    result = (
+        np.asarray(vectors, dtype=np.float32),
+        np.asarray(patent_indexes, dtype=np.int32),
+    )
+
+    store[cache_key] = {
+        "vectors": result[0],
+        "indexes": result[1],
+        "created_at": time.time(),
+    }
+    while len(store) > EMBEDDING_CACHE_MAX_ENTRIES:
+        oldest = min(store, key=lambda key: store[key]["created_at"])
+        store.pop(oldest, None)
+
+    return result
 
 def semantic_search(
     query: str,
     documents: list[str],
     api_key: str,
     model_name: str = EMBEDDING_MODEL,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> list[float]:
     """Score each patent by its most semantically similar text chunk."""
     if OpenAI is None:
         raise RuntimeError("OpenAI package is missing")
 
+    _report(progress_callback, 0.0, "Embedding the product description...")
     client = OpenAI(api_key=api_key)
     safe_query = str(query).strip()[:QUERY_MAX_CHARS]
     query_response = client.embeddings.create(model=model_name, input=safe_query)
     query_vector = np.asarray(query_response.data[0].embedding, dtype=np.float32)
 
     chunk_vectors, patent_indexes = get_document_embeddings(
-        tuple(documents), model_name, api_key
+        tuple(documents), model_name, api_key,
+        progress_callback=_scaled(progress_callback, 0.05, 0.95),
     )
+
+    _report(progress_callback, 0.95, "Scoring patents by semantic similarity...")
 
     # Cosine similarity between the query and every chunk.
     query_norm = np.linalg.norm(query_vector)
@@ -233,6 +333,8 @@ def semantic_search(
         patent_scores[patent_index] = max(
             patent_scores[patent_index], float(chunk_scores[chunk_index])
         )
+
+    _report(progress_callback, 1.0, "Semantic scoring complete")
     return patent_scores.astype(float).tolist()
 
 def retrieve_patents(
@@ -242,6 +344,7 @@ def retrieve_patents(
     semantic_threshold: float = 0.33,
     use_openai_embeddings: bool = True,
     rrf_k: int = 60,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Retrieve candidates if they qualify via TF-IDF or semantic score."""
     query = str(product_description or "").strip()
@@ -252,12 +355,18 @@ def retrieve_patents(
     if not 0.0 <= semantic_threshold <= 1.0:
         raise ValueError("Semantic threshold must be between 0 and 1.")
 
+    _report(progress_callback, 0.0, "Preparing the patent dataset...")
     df = prepare_patents_dataframe(source_df)
     documents = df["search_text"].tolist()
+    _report(
+        progress_callback, 0.03,
+        f"Dataset ready: {len(df):,} searchable patents. Running TF-IDF search..."
+    )
 
     tfidf_scores = tfidf_search(query, documents)
     df["TF-IDF Similarity"] = tfidf_scores
     rankings: dict[str, list[float]] = {"TF-IDF": tfidf_scores}
+    _report(progress_callback, 0.20, "TF-IDF search complete")
 
     semantic_scores: list[float] | None = None
     if use_openai_embeddings:
@@ -268,9 +377,14 @@ def retrieve_patents(
                 
             )
         
-        semantic_scores = semantic_search(query, documents, api_key)
+        semantic_scores = semantic_search(
+            query, documents, api_key,
+            progress_callback=_scaled(progress_callback, 0.20, 0.90),
+        )
         df["Semantic Similarity"] = semantic_scores
         rankings["Semantic"] = semantic_scores
+
+    _report(progress_callback, 0.90, "Applying thresholds and ranking results...")
 
     # Combined retrieval rule: a patent qualifies through ANY enabled method.
     qualifying_mask = df["TF-IDF Similarity"] >= similarity_threshold
@@ -300,13 +414,14 @@ def retrieve_patents(
         "corpus_size": len(df),
         "candidates_returned": len(candidates),
     }
+    _report(progress_callback, 1.0, "Finalizing results...")
     return candidates, metadata
 
 
 def main() -> None:
     st.title("Patent Search")
     st.caption(
-        "Search the product description. This retrieves the relevant patent candidates"
+        "Search the product description. This tool retrieves the relevant patent candidates corresponding to a product description"
     )
     st.divider()
 
@@ -367,27 +482,43 @@ def main() -> None:
         elif uploaded_file is None:
             st.error("Please upload the patent corpus Excel file.")
         else:
+            # Live progress bar shown to the user for the whole run.
+            progress_slot = st.empty()
+            progress_bar = progress_slot.progress(0.0, text="Starting patent search...")
+
+            def update_progress(fraction: float, message: str) -> None:
+                progress_bar.progress(
+                    min(max(float(fraction), 0.0), 1.0),
+                    text=f"{int(min(max(fraction, 0.0), 1.0) * 100)}% | {message}",
+                )
+
             try:
+                # Reading the Excel file takes the first 5% of the bar,
+                # the search itself takes the remaining 95%.
+                update_progress(0.0, "Reading the uploaded patent file (large files can take a while)...")
                 source_df = pd.read_excel(uploaded_file, engine="openpyxl")
-                with st.spinner(
-                    "Searching patents... OpenAI may embed the corpus on the first run; cached embeddings are reused afterward."
-                ):
-                    candidates, metadata = retrieve_patents(
-                        source_df=source_df,
-                        product_description=product_description,
-                        similarity_threshold=similarity_threshold,
-                        semantic_threshold=semantic_threshold,
-                        # use_openai_embeddings=use_openai_embeddings,
-                    )
+                update_progress(0.05, f"File loaded: {len(source_df):,} rows")
+
+                candidates, metadata = retrieve_patents(
+                    source_df=source_df,
+                    product_description=product_description,
+                    similarity_threshold=similarity_threshold,
+                    semantic_threshold=semantic_threshold,
+                    # use_openai_embeddings=use_openai_embeddings,
+                    progress_callback=_scaled(update_progress, 0.05, 1.0),
+                )
                 st.session_state["patent_search_candidates"] = candidates
                 st.session_state["patent_search_metadata"] = metadata
                 st.session_state["patent_search_product_description"] = product_description
                 st.session_state["patent_search_corpus_name"] = uploaded_file.name
+
+                update_progress(1.0, "Search complete")
                 st.success(
                     f"Retrieved {len(candidates)} qualifying patents from "
                     f"{metadata['corpus_size']} searchable records."
                 )
             except Exception as exc:
+                progress_slot.empty()
                 st.error(f"Patent search failed: {exc}")
 
     candidates = st.session_state.get("patent_search_candidates")
@@ -462,8 +593,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
 
 
 # from __future__ import annotations
