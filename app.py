@@ -274,7 +274,7 @@ def get_document_embeddings(
         _report(
             progress_callback,
             done / total_chunks,
-            f"Embedding patent text (first run only): {done:,} of {total_chunks:,} sections",
+            f"Embedding patent text: {done:,} of {total_chunks:,} sections",
         )
 
     if any(vector is None for vector in vectors):
