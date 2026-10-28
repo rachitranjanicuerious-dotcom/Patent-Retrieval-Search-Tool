@@ -144,7 +144,7 @@ def tfidf_search(query: str, documents: list[str]) -> list[float]:
         lowercase=True,
         stop_words="english",
         ngram_range=(1, 2),
-        max_features=300_000,
+        max_features= 200_000 , #300_000
         sublinear_tf=True,
     )
     matrix = vectorizer.fit_transform(corpus)
@@ -173,7 +173,7 @@ def split_for_embeddings(text: str, max_chars: int = EMBEDDING_CHUNK_CHARS) -> l
     chunks = [text[start:start + max_chars] for start in range(0, len(text), step)]
     return [chunk for chunk in chunks if chunk.strip()]
 
-@st.cache_data(show_spinner=False, ttl=86400)
+@st.cache_data(show_spinner=False, ttl=86400, max_entries=2)
 def get_document_embeddings(
     documents: tuple[str, ...], model_name: str, api_key: str
 ) -> tuple[np.ndarray, np.ndarray]:
